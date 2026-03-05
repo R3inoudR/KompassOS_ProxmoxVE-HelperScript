@@ -93,12 +93,6 @@ https://isos.kompassos.nl/
 
 ------------------------------------------------------------------------
 
-## Repository Structure
-
-proxmox/ └── kompassos-vm.sh
-
-------------------------------------------------------------------------
-
 ## License
 
 This project is licensed under the **Apache License 2.0**.
