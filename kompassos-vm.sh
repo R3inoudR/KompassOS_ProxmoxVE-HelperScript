@@ -16,6 +16,11 @@
 # limitations under the License.
 #
 # This script creates a KompassOS VM in Proxmox VE and attaches the KompassOS HWE installer ISO.
+# Notes:
+# - Only the HWE ISO is supported.
+# - ISO storage can be dir, nfs, cifs, cephfs, etc. as long as Proxmox can resolve a filesystem path
+#   and it is writable (checked via pvesm path + write test).
+# - Save this file with LF line endings (not CRLF).
 
 set -euo pipefail
 
@@ -49,7 +54,7 @@ die()       { msg_error "$1"; echo -e "\nExiting..."; exit 1; }
 
 header_info() {
   clear
-  # "Big" style banner for KompassOS (TAAG Big look)
+  # "Big" style banner for KompassOS (TAAG Big-like)
   cat <<'EOF'
   _  __                                    ____   _____ 
  | |/ /                                   / __ \ / ____|
@@ -210,11 +215,21 @@ pick_storage_menu() {
   echo "$choice"
 }
 
-ensure_iso_dir_storage() {
+# ISO storage: accept dir, nfs, cifs, cephfs, etc. as long as:
+# - Proxmox can resolve a filesystem path via pvesm path
+# - The resolved directory is writable
+ensure_iso_storage_writable() {
   local st="$1"
-  local st_type
-  st_type="$(pvesm status -storage "$st" | awk 'NR>1 {print $2}')"
-  [[ "$st_type" == "dir" ]] || die "ISO storage '$st' is type '$st_type'. ISO storage must be 'dir' (e.g. local)."
+  local test_path test_dir
+
+  test_path="$(pvesm path "${st}:iso/${ISO_NAME}" 2>/dev/null || true)"
+  [[ -n "$test_path" ]] || die "ISO storage '$st' does not provide a filesystem path for ISO volumes (pvesm path failed)."
+
+  test_dir="$(dirname "$test_path")"
+  mkdir -p "$test_dir" 2>/dev/null || die "Cannot create ISO directory on storage '$st': $test_dir"
+
+  touch "${test_dir}/.kompassos-write-test" 2>/dev/null || die "ISO storage '$st' is not writable: $test_dir"
+  rm -f "${test_dir}/.kompassos-write-test" 2>/dev/null || true
 }
 
 # --- Defaults / Advanced ---
@@ -410,7 +425,7 @@ msg_ok "Using ${BL}${VM_STORAGE}${GN} for VM disk storage."
 
 msg_info "Selecting ISO storage"
 ISO_STORAGE="$(pick_storage_menu "iso" "ISO Storage" "Where should the KompassOS ISO be stored?")"
-ensure_iso_dir_storage "$ISO_STORAGE"
+ensure_iso_storage_writable "$ISO_STORAGE"
 msg_ok "Using ${BL}${ISO_STORAGE}${GN} for ISO storage."
 
 msg_info "Resolving ISO path"
