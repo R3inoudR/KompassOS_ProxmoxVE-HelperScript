@@ -1,32 +1,45 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# KompassOS (HWE) VM Helper Script for Proxmox VE
+# KompassOS (HWE) VM Installer for Proxmox VE
+#
+# Copyright (c) 2026
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-# http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# KompassOS references:
+# - https://github.com/L0g0ff/KompassOS
+# - https://www.kompassos.nl/
 #
 # Notes:
-# - Only KompassOS HWE ISO is supported.
-# - ISO storage can be dir/nfs/cifs/cephfs/... if pvesm path resolves and it is writable.
-# - Disk size is numeric GiB (e.g. 64) to avoid ZFS parsing issues.
+# - Only the KompassOS HWE ISO is supported.
+# - ISO storage may be dir/nfs/cifs/cephfs/... as long as pvesm path resolves and is writable.
+# - Disk size is numeric GiB to avoid ZFS parsing issues.
 # - Save with LF line endings (not CRLF).
 
 set -euo pipefail
 
-# Community helper functions (telemetry/hooks used by community scripts)
-source /dev/stdin <<<"$(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/api.func)"
+# -------------------------
+# Constants (KompassOS HWE)
+# -------------------------
+BASE_URL="https://isos.kompassos.nl"
+ISO_NAME="kompassos-dx-hwe.iso"
+ISO_URL="${BASE_URL}/${ISO_NAME}"
+SUM_URL="${BASE_URL}/${ISO_NAME}-CHECKSUM"
 
-RANDOM_UUID="$(cat /proc/sys/kernel/random/uuid)"
-METHOD=""
-NSAPP="kompassos-hwe-vm"
-var_os="kompassos"
-var_version="hwe"
-
-# --- UI / Formatting ---
+# -------------
+# UI / Styling
+# -------------
 YW=$'\033[33m'
 BL=$'\033[36m'
 RD=$'\033[01;31m'
@@ -35,15 +48,16 @@ DGN=$'\033[32m'
 CL=$'\033[m'
 BFR=$'\r\033[K'
 TAB="  "
-CM="${TAB}✔️  ${CL}"
-CROSS="${TAB}✖️  ${CL}"
+OK_MARK="${TAB}✔️  "
+ERR_MARK="${TAB}✖️  "
 
-msg_info()  { echo -ne "${TAB}${YW}$1...${CL}"; }
-msg_ok()    { echo -e  "${BFR}${CM}${GN}$1${CL}"; }
-msg_error() { echo -e  "${BFR}${CROSS}${RD}$1${CL}"; }
-die()       { msg_error "$1"; echo -e "\nExiting..."; exit 1; }
+info()  { echo -e "${TAB}${YW}[INFO]${CL}  $*"; }
+ok()    { echo -e "${BFR}${OK_MARK}${GN}$*${CL}"; }
+warn()  { echo -e "${TAB}${YW}[WARN]${CL}  $*"; }
+err()   { echo -e "${BFR}${ERR_MARK}${RD}$*${CL}"; }
+die()   { err "$*"; echo -e "\nExiting..."; exit 1; }
 
-header_info() {
+header() {
   clear
   cat <<'EOF'
   _  __                                    ____   _____ 
@@ -62,153 +76,265 @@ EOF
   echo
 }
 
-# --- KompassOS HWE only ---
-BASE_URL="https://isos.kompassos.nl"
-ISO_NAME="kompassos-dx-hwe.iso"
-ISO_URL="${BASE_URL}/${ISO_NAME}"
-SUM_URL="${BASE_URL}/${ISO_NAME}-CHECKSUM"
-
-TEMP_DIR="$(mktemp -d)"
-pushd "$TEMP_DIR" >/dev/null
-
-cleanup_vmid() {
-  if [[ -n "${VMID:-}" ]] && qm status "$VMID" &>/dev/null; then
-    qm stop "$VMID" &>/dev/null || true
-    qm destroy "$VMID" &>/dev/null || true
+# -----------------
+# Basic prerequisites
+# -----------------
+require_root() {
+  if [[ "$(id -u)" -ne 0 ]]; then
+    die "Run this script as root."
   fi
 }
 
-cleanup() {
-  local exit_code=$?
-  popd >/dev/null || true
-  rm -rf "$TEMP_DIR" || true
-
-  if [[ "${POST_TO_API_DONE:-}" == "true" && "${POST_UPDATE_DONE:-}" != "true" ]]; then
-    if [[ $exit_code -eq 0 ]]; then
-      post_update_to_api "done" "none" || true
-    else
-      post_update_to_api "failed" "$exit_code" || true
-    fi
+require_cmds() {
+  local missing=()
+  local c
+  for c in "$@"; do
+    command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+  done
+  if (( ${#missing[@]} > 0 )); then
+    die "Missing required command(s): ${missing[*]}"
   fi
 }
-trap cleanup EXIT
 
-error_handler() {
-  local exit_code="$?"
-  post_update_to_api "failed" "${exit_code}" || true
-  echo -e "\n${RD}[ERROR]${CL} Exit code ${RD}${exit_code}${CL} while executing: ${YW}${BASH_COMMAND}${CL}\n"
-  cleanup_vmid || true
-  exit "${exit_code}"
-}
-trap error_handler ERR
-trap 'post_update_to_api "failed" "130" || true; cleanup_vmid || true; exit 130' SIGINT
-trap 'post_update_to_api "failed" "143" || true; cleanup_vmid || true; exit 143' SIGTERM
-
-check_root() {
-  if [[ "$(id -u)" -ne 0 || "$(ps -o comm= -p "$PPID")" == "sudo" ]]; then
-    clear
-    msg_error "Please run this script as root (not via sudo)."
-    echo -e "\nExiting..."
-    exit 1
-  fi
+require_pve() {
+  command -v pveversion >/dev/null 2>&1 || die "This does not look like a Proxmox VE host (pveversion not found)."
+  command -v pvesm >/dev/null 2>&1 || die "pvesm not found."
+  command -v qm >/dev/null 2>&1 || die "qm not found."
 }
 
 arch_check() {
-  if [[ "$(dpkg --print-architecture)" != "amd64" ]]; then
-    die "Unsupported architecture: $(dpkg --print-architecture) (amd64 only)."
-  fi
+  local arch
+  arch="$(dpkg --print-architecture)"
+  [[ "$arch" == "amd64" ]] || die "Unsupported architecture: $arch (amd64 only)."
 }
 
-pve_check() {
-  local ver
-  ver="$(pveversion | awk -F'/' '{print $2}' | awk -F'-' '{print $1}')"
-  [[ "$ver" =~ ^(8|9)\. ]] || die "Unsupported Proxmox VE version: ${ver} (expected 8.x or 9.x)."
-}
-
-ssh_check() {
+ssh_warning() {
   if [[ -n "${SSH_CLIENT:-}" ]]; then
-    if ! whiptail --backtitle "Proxmox VE Helper Scripts" --defaultno \
+    if ! whiptail --backtitle "KompassOS VM Installer" --defaultno \
       --title "SSH DETECTED" \
-      --yesno "It's suggested to use the Proxmox host shell instead of SSH.\nProceed anyway?" 10 62; then
-      die "User exited script"
+      --yesno "It's recommended to run from the Proxmox host console instead of SSH.\nProceed anyway?" 10 70; then
+      die "User aborted."
     fi
   fi
 }
 
-get_valid_nextid() {
-  local try_id
-  try_id="$(pvesh get /cluster/nextid)"
-  while true; do
-    if [[ -f "/etc/pve/qemu-server/${try_id}.conf" || -f "/etc/pve/lxc/${try_id}.conf" ]]; then
-      try_id=$((try_id + 1)); continue
-    fi
-    if lvs --noheadings -o lv_name 2>/dev/null | grep -qE "(^|[-_])${try_id}($|[-_])"; then
-      try_id=$((try_id + 1)); continue
-    fi
-    break
-  done
-  echo "$try_id"
+# -----------------
+# CRLF guard (helps prevent \r problems)
+# -----------------
+crlf_guard() {
+  # If the script itself contains CRLF, bail with a clear message.
+  if grep -q $'\r' "$0"; then
+    die "This script contains CRLF line endings. Convert to LF (Unix) and try again."
+  fi
 }
 
-exit_script() { header_info; die "User exited script"; }
+# -----------------
+# Helpers
+# -----------------
+get_next_vmid() {
+  local id
+  id="$(pvesh get /cluster/nextid)"
+  echo "$id"
+}
+
+is_id_in_use() {
+  local id="$1"
+  [[ -f "/etc/pve/qemu-server/${id}.conf" || -f "/etc/pve/lxc/${id}.conf" ]]
+}
 
 normalize_gib() {
+  # Accept: "64", "64G", "64g", "64GiB", " 64 " -> output numeric "64"
   local in="${1//[[:space:]]/}"
   in="${in,,}"
-  in="${in%gib}"; in="${in%gb}"; in="${in%g}"
+  in="${in%gib}"
+  in="${in%gb}"
+  in="${in%g}"
   [[ "$in" =~ ^[0-9]+$ ]] || return 1
   echo "$in"
 }
 
+# -----------------
+# Storage selection
+# -----------------
 pick_storage_menu() {
+  # $1 content (images|iso), $2 title, $3 prompt
   local content="$1" title="$2" prompt="$3"
-  local menu=() msg_max=0 line tag typ free item offset
 
-  while read -r line; do
+  local lines menu=() msg_max=0
+  lines="$(pvesm status -content "$content" | awk 'NR>1')"
+  [[ -n "$lines" ]] || die "No storage found for content='$content'."
+
+  while IFS= read -r line; do
+    local tag typ free item
     tag="$(awk '{print $1}' <<<"$line")"
     typ="$(awk '{printf "%-10s", $2}' <<<"$line")"
     free="$(numfmt --field 4-6 --from-unit=K --to=iec --format %.2f <<<"$line" | awk '{printf("%9sB", $6)}')"
     item=" Type: $typ Free: $free "
-    offset=2
-    (( ${#item} + offset > msg_max )) && msg_max=$(( ${#item} + offset ))
+    (( ${#item} > msg_max )) && msg_max=${#item}
     menu+=("$tag" "$item" "OFF")
-  done < <(pvesm status -content "$content" | awk 'NR>1')
+  done <<<"$lines"
 
   local count=$(( ${#menu[@]} / 3 ))
-  (( count == 0 )) && die "No valid storage found for content '$content'."
-  if (( count == 1 )); then echo "${menu[0]}"; return 0; fi
+  if (( count == 1 )); then
+    echo "${menu[0]}"
+    return 0
+  fi
 
   local choice=""
   while [[ -z "$choice" ]]; do
-    choice="$(whiptail --backtitle "Proxmox VE Helper Scripts" \
+    choice="$(whiptail --backtitle "KompassOS VM Installer" \
       --title "$title" \
-      --radiolist "$prompt\nTo make a selection, use the Spacebar.\n" \
-      16 $((msg_max + 23)) 6 \
-      "${menu[@]}" 3>&1 1>&2 2>&3)" || exit_script
+      --radiolist "$prompt\nUse Spacebar to select.\n" \
+      16 $((msg_max + 26)) 8 \
+      "${menu[@]}" 3>&1 1>&2 2>&3)" || die "User aborted."
   done
   echo "$choice"
 }
 
 ensure_iso_storage_writable() {
-  local st="$1" test_path test_dir
+  local st="$1"
+  local test_path test_dir
+
   test_path="$(pvesm path "${st}:iso/${ISO_NAME}" 2>/dev/null || true)"
   [[ -n "$test_path" ]] || die "ISO storage '$st' does not provide a filesystem path for ISO volumes (pvesm path failed)."
+
   test_dir="$(dirname "$test_path")"
   mkdir -p "$test_dir" 2>/dev/null || die "Cannot create ISO directory on storage '$st': $test_dir"
+
   touch "${test_dir}/.kompassos-write-test" 2>/dev/null || die "ISO storage '$st' is not writable: $test_dir"
   rm -f "${test_dir}/.kompassos-write-test" 2>/dev/null || true
 }
 
-# --- Defaults / Advanced ---
-VMID="$(get_valid_nextid)"
+# -----------------
+# ISO download + checksum
+# -----------------
+download_iso_if_missing() {
+  local iso_path="$1"
+  if [[ -f "$iso_path" ]]; then
+    ok "ISO already exists: ${iso_path}"
+    return 0
+  fi
+
+  info "Downloading: ${ISO_URL}"
+  mkdir -p "$(dirname "$iso_path")"
+  curl -f#SL -o "$iso_path" "$ISO_URL"
+  echo -en "\e[1A\e[0K"
+  ok "ISO downloaded: ${iso_path}"
+}
+
+verify_checksum_best_effort() {
+  local iso_path="$1"
+
+  if ! command -v sha256sum >/dev/null 2>&1; then
+    warn "sha256sum not found; skipping checksum verification."
+    return 0
+  fi
+
+  info "Attempting checksum verification (best-effort)..."
+  if ! curl -fsSL -o checksum.txt "$SUM_URL"; then
+    warn "Checksum file download failed; skipping verification."
+    return 0
+  fi
+
+  local expected actual
+  expected="$(grep -Eo '([a-fA-F0-9]{64})' checksum.txt | head -n1 || true)"
+  if [[ -z "${expected:-}" ]]; then
+    warn "Checksum format not recognized; skipping verification."
+    return 0
+  fi
+
+  actual="$(sha256sum "$iso_path" | awk '{print $1}')"
+  if [[ "${actual,,}" != "${expected,,}" ]]; then
+    die "Checksum mismatch for ${ISO_NAME}"
+  fi
+  ok "Checksum OK (sha256)."
+}
+
+# -----------------
+# VM creation
+# -----------------
+create_vm() {
+  local vmid="$1"
+  local name="$2"
+  local machine="$3"
+  local uefi="$4"        # yes|no
+  local cpu_model="$5"   # kvm64|host
+  local cores="$6"
+  local ram_mib="$7"
+  local disk_gib="$8"    # numeric
+  local disk_cache="$9"  # "" or "cache=writethrough,"
+  local bridge="${10}"
+  local vlan="${11}"     # "" or ",tag=###"
+  local mtu="${12}"      # "" or ",mtu=####"
+  local vm_storage="${13}"
+  local iso_storage="${14}"
+
+  local thin="discard=on,ssd=1,"
+  local storage_type
+  storage_type="$(pvesm status -storage "$vm_storage" | awk 'NR>1 {print $2}')"
+  case "$storage_type" in
+    nfs|dir|btrfs) thin="" ;; # those are file-based or already handle discard differently
+    *) : ;;
+  esac
+
+  local cpu_arg=""
+  [[ "$cpu_model" == "host" ]] && cpu_arg="-cpu host"
+
+  local machine_arg=""
+  [[ "$machine" == "q35" ]] && machine_arg="-machine q35"
+
+  local bios_arg=""
+  [[ "$uefi" == "yes" ]] && bios_arg="-bios ovmf"
+
+  info "Creating VM ${vmid} (${name})..."
+
+  qm create "$vmid" \
+    -agent 1 \
+    -tablet 0 \
+    -localtime 1 \
+    ${machine_arg} \
+    ${bios_arg} \
+    ${cpu_arg} \
+    -cores "$cores" \
+    -memory "$ram_mib" \
+    -balloon 0 \
+    -name "$name" \
+    -tags "kompassos" \
+    -net0 "virtio,bridge=${bridge}${vlan}${mtu}" \
+    -onboot 1 \
+    -ostype l26 \
+    -scsihw virtio-scsi-pci \
+    -rng0 source=/dev/urandom \
+    >/dev/null
+
+  if [[ "$uefi" == "yes" ]]; then
+    qm set "$vmid" -efidisk0 "${vm_storage}:0,format=raw,efitype=4m,pre-enrolled-keys=1" >/dev/null
+  fi
+
+  # IMPORTANT: numeric disk size (GiB) avoids ZFS "64G" parsing errors.
+  qm set "$vmid" -scsi0 "${vm_storage}:${disk_gib},format=raw,${disk_cache}${thin}iothread=1" >/dev/null
+  qm set "$vmid" -ide2 "${iso_storage}:iso/${ISO_NAME},media=cdrom" >/dev/null
+  qm set "$vmid" -serial0 socket -vga virtio >/dev/null
+
+  # IMPORTANT: Proxmox expects semicolons
+  qm set "$vmid" -boot "order=ide2;scsi0" >/dev/null
+
+  ok "VM created: ${vmid}"
+}
+
+# -----------------
+# Menus (Default / Advanced)
+# -----------------
+# Defaults (safe / sane)
+VMID="$(get_next_vmid)"
 HN="kompassos"
 MACHINE="q35"
 UEFI="yes"
 CPU_MODEL="kvm64"
 CORES="4"
 RAM_MIB="8192"
-DISK_GIB="64"   # numeric only
-DISK_CACHE=""
+DISK_GIB="64"       # numeric
+DISK_CACHE=""       # or "cache=writethrough,"
 BRIDGE="vmbr0"
 VLAN=""
 MTU=""
@@ -216,23 +342,7 @@ VERIFY_SUM="yes"
 START_VM="yes"
 
 default_settings() {
-  METHOD="default"
-  VMID="$(get_valid_nextid)"
-  HN="kompassos"
-  MACHINE="q35"
-  UEFI="yes"
-  CPU_MODEL="kvm64"
-  CORES="4"
-  RAM_MIB="8192"
-  DISK_GIB="64"
-  DISK_CACHE=""
-  BRIDGE="vmbr0"
-  VLAN=""
-  MTU=""
-  VERIFY_SUM="yes"
-  START_VM="yes"
-
-  header_info
+  header
   echo -e "${TAB}${DGN}Using default settings:${CL}\n"
   echo -e "${TAB}VMID:      ${VMID}"
   echo -e "${TAB}Hostname:  ${HN}"
@@ -246,93 +356,98 @@ default_settings() {
   echo -e "${TAB}Checksum:  ${VERIFY_SUM}"
   echo -e "${TAB}Start VM:  ${START_VM}\n"
 
-  whiptail --backtitle "Proxmox VE Helper Scripts" --title "READY" \
-    --yesno "Ready to create the KompassOS (HWE) VM with default settings?" 10 70 \
-    || exit_script
+  whiptail --backtitle "KompassOS VM Installer" --title "READY" \
+    --yesno "Create the KompassOS (HWE) VM with default settings?" 10 74 \
+    || die "User aborted."
 }
 
 advanced_settings() {
-  METHOD="advanced"
-  header_info
-
+  header
   local v
 
-  v="$(whiptail --backtitle "Proxmox VE Helper Scripts" --title "VMID" \
-    --inputbox "Set Virtual Machine ID" 8 58 "$VMID" 3>&1 1>&2 2>&3)" || exit_script
-  VMID="${v:-$(get_valid_nextid)}"
-  if qm status "$VMID" &>/dev/null || pct status "$VMID" &>/dev/null; then
-    die "ID $VMID is already in use."
-  fi
+  v="$(whiptail --backtitle "KompassOS VM Installer" --title "VMID" \
+    --inputbox "Set Virtual Machine ID" 8 58 "$VMID" 3>&1 1>&2 2>&3)" || die "User aborted."
+  VMID="${v:-$VMID}"
+  [[ "$VMID" =~ ^[0-9]+$ ]] || die "Invalid VMID."
+  is_id_in_use "$VMID" && die "ID $VMID is already in use."
 
-  v="$(whiptail --backtitle "Proxmox VE Helper Scripts" --title "HOSTNAME" \
-    --inputbox "Set Hostname" 8 58 "$HN" 3>&1 1>&2 2>&3)" || exit_script
+  v="$(whiptail --backtitle "KompassOS VM Installer" --title "HOSTNAME" \
+    --inputbox "Set VM name" 8 58 "$HN" 3>&1 1>&2 2>&3)" || die "User aborted."
   HN="$(echo "${v:-kompassos}" | tr -d ' ' | tr '[:upper:]' '[:lower:]')"
   [[ -n "$HN" ]] || HN="kompassos"
 
-  local mach
-  mach="$(whiptail --backtitle "Proxmox VE Helper Scripts" --title "MACHINE TYPE" \
-    --radiolist "Choose machine type" 10 58 2 \
+  MACHINE="$(whiptail --backtitle "KompassOS VM Installer" --title "MACHINE TYPE" \
+    --radiolist "Choose machine type" 10 60 2 \
     "q35" "Recommended" ON \
     "i440fx" "Legacy" OFF \
-    3>&1 1>&2 2>&3)" || exit_script
-  MACHINE="$mach"
+    3>&1 1>&2 2>&3)" || die "User aborted."
 
-  if whiptail --backtitle "Proxmox VE Helper Scripts" --title "FIRMWARE" \
-    --yesno "Use UEFI/OVMF (recommended)?" 10 58; then
+  if whiptail --backtitle "KompassOS VM Installer" --title "FIRMWARE" \
+    --yesno "Use UEFI/OVMF (recommended)?" 10 60; then
     UEFI="yes"
   else
     UEFI="no"
   fi
 
-  local cpu
-  cpu="$(whiptail --backtitle "Proxmox VE Helper Scripts" --title "CPU MODEL" \
-    --radiolist "Choose CPU model" 10 58 2 \
+  CPU_MODEL="$(whiptail --backtitle "KompassOS VM Installer" --title "CPU MODEL" \
+    --radiolist "Choose CPU model" 10 60 2 \
     "kvm64" "Default" ON \
     "host" "Host passthrough" OFF \
-    3>&1 1>&2 2>&3)" || exit_script
-  CPU_MODEL="$cpu"
+    3>&1 1>&2 2>&3)" || die "User aborted."
 
-  v="$(whiptail --backtitle "Proxmox VE Helper Scripts" --title "CORES" \
-    --inputbox "Allocate CPU cores" 8 58 "$CORES" 3>&1 1>&2 2>&3)" || exit_script
-  CORES="${v:-4}"
+  v="$(whiptail --backtitle "KompassOS VM Installer" --title "CORES" \
+    --inputbox "CPU cores" 8 58 "$CORES" 3>&1 1>&2 2>&3)" || die "User aborted."
+  [[ "${v:-}" =~ ^[0-9]+$ ]] || die "Invalid cores."
+  CORES="$v"
 
-  v="$(whiptail --backtitle "Proxmox VE Helper Scripts" --title "RAM" \
-    --inputbox "Allocate RAM in MiB" 8 58 "$RAM_MIB" 3>&1 1>&2 2>&3)" || exit_script
-  RAM_MIB="${v:-8192}"
+  v="$(whiptail --backtitle "KompassOS VM Installer" --title "RAM" \
+    --inputbox "Memory in MiB" 8 58 "$RAM_MIB" 3>&1 1>&2 2>&3)" || die "User aborted."
+  [[ "${v:-}" =~ ^[0-9]+$ ]] || die "Invalid RAM."
+  RAM_MIB="$v"
 
-  v="$(whiptail --backtitle "Proxmox VE Helper Scripts" --title "DISK SIZE" \
-    --inputbox "Disk size in GiB (e.g. 64 or 64G)" 8 58 "${DISK_GIB}G" 3>&1 1>&2 2>&3)" || exit_script
-  if ! DISK_GIB="$(normalize_gib "${v:-64G}")"; then
-    die "Invalid disk size. Use numeric GiB, e.g. 64 or 64G."
-  fi
+  v="$(whiptail --backtitle "KompassOS VM Installer" --title "DISK" \
+    --inputbox "Disk size in GiB (e.g. 64 or 64G)" 8 64 "${DISK_GIB}G" 3>&1 1>&2 2>&3)" || die "User aborted."
+  DISK_GIB="$(normalize_gib "${v:-64G}")" || die "Invalid disk size. Use e.g. 64 or 64G."
 
   local cache_choice
-  cache_choice="$(whiptail --backtitle "Proxmox VE Helper Scripts" --title "DISK CACHE" \
-    --radiolist "Choose disk cache mode" 10 58 2 \
+  cache_choice="$(whiptail --backtitle "KompassOS VM Installer" --title "DISK CACHE" \
+    --radiolist "Choose disk cache mode" 10 60 2 \
     "none" "Default" ON \
     "writethrough" "Write Through" OFF \
-    3>&1 1>&2 2>&3)" || exit_script
-  [[ "$cache_choice" == "writethrough" ]] && DISK_CACHE="cache=writethrough," || DISK_CACHE=""
+    3>&1 1>&2 2>&3)" || die "User aborted."
+  if [[ "$cache_choice" == "writethrough" ]]; then
+    DISK_CACHE="cache=writethrough,"
+  else
+    DISK_CACHE=""
+  fi
 
-  v="$(whiptail --backtitle "Proxmox VE Helper Scripts" --title "BRIDGE" \
-    --inputbox "Set network bridge" 8 58 "$BRIDGE" 3>&1 1>&2 2>&3)" || exit_script
+  v="$(whiptail --backtitle "KompassOS VM Installer" --title "BRIDGE" \
+    --inputbox "Network bridge" 8 58 "$BRIDGE" 3>&1 1>&2 2>&3)" || die "User aborted."
   BRIDGE="${v:-vmbr0}"
 
-  v="$(whiptail --backtitle "Proxmox VE Helper Scripts" --title "VLAN" \
-    --inputbox "Set VLAN tag (blank = default)" 8 58 "" 3>&1 1>&2 2>&3)" || exit_script
+  v="$(whiptail --backtitle "KompassOS VM Installer" --title "VLAN" \
+    --inputbox "VLAN tag (blank = none)" 8 58 "" 3>&1 1>&2 2>&3)" || die "User aborted."
   [[ -n "$v" ]] && VLAN=",tag=$v" || VLAN=""
 
-  v="$(whiptail --backtitle "Proxmox VE Helper Scripts" --title "MTU" \
-    --inputbox "Set MTU (blank = default)" 8 58 "" 3>&1 1>&2 2>&3)" || exit_script
+  v="$(whiptail --backtitle "KompassOS VM Installer" --title "MTU" \
+    --inputbox "MTU (blank = default)" 8 58 "" 3>&1 1>&2 2>&3)" || die "User aborted."
   [[ -n "$v" ]] && MTU=",mtu=$v" || MTU=""
 
-  whiptail --backtitle "Proxmox VE Helper Scripts" --title "CHECKSUM" \
-    --yesno "Verify ISO checksum (best-effort)?" 10 58 && VERIFY_SUM="yes" || VERIFY_SUM="no"
+  if whiptail --backtitle "KompassOS VM Installer" --title "CHECKSUM" \
+    --yesno "Verify ISO checksum (best-effort)?" 10 60; then
+    VERIFY_SUM="yes"
+  else
+    VERIFY_SUM="no"
+  fi
 
-  whiptail --backtitle "Proxmox VE Helper Scripts" --title "START VM" \
-    --yesno "Start VM when completed?" 10 58 && START_VM="yes" || START_VM="no"
+  if whiptail --backtitle "KompassOS VM Installer" --title "START VM" \
+    --yesno "Start VM after creation?" 10 60; then
+    START_VM="yes"
+  else
+    START_VM="no"
+  fi
 
-  header_info
+  header
   echo -e "${TAB}${DGN}Advanced settings summary:${CL}\n"
   echo -e "${TAB}VMID:      ${VMID}"
   echo -e "${TAB}Hostname:  ${HN}"
@@ -346,142 +461,70 @@ advanced_settings() {
   echo -e "${TAB}Checksum:  ${VERIFY_SUM}"
   echo -e "${TAB}Start VM:  ${START_VM}\n"
 
-  whiptail --backtitle "Proxmox VE Helper Scripts" --title "READY" \
-    --yesno "Ready to create the KompassOS (HWE) VM using the above settings?" 10 76 \
-    || advanced_settings
+  whiptail --backtitle "KompassOS VM Installer" --title "READY" \
+    --yesno "Create VM with these settings?" 10 74 \
+    || die "User aborted."
 }
 
 start_menu() {
-  header_info
-  whiptail --backtitle "Proxmox VE Helper Scripts" --title "KompassOS (HWE) VM" \
-    --yesno "This will create a new KompassOS (HWE) VM.\nProceed?" 10 62 \
-    || exit_script
+  header
+  whiptail --backtitle "KompassOS VM Installer" --title "KompassOS (HWE) VM" \
+    --yesno "This will create a new KompassOS (HWE) VM.\nProceed?" 10 70 \
+    || die "User aborted."
 
-  if whiptail --backtitle "Proxmox VE Helper Scripts" --title "SETTINGS" \
-    --yesno "Use default settings?" --no-button "Advanced" 10 58; then
+  if whiptail --backtitle "KompassOS VM Installer" --title "SETTINGS" \
+    --yesno "Use default settings?" --no-button "Advanced" 10 60; then
     default_settings
   else
     advanced_settings
   fi
 }
 
-check_root
+# -----------------
+# Main
+# -----------------
+require_root
+crlf_guard
+require_cmds whiptail curl awk sed grep numfmt
+require_pve
 arch_check
-pve_check
-ssh_check
+ssh_warning
+
 start_menu
 
-post_to_api_vm
-
-header_info
-msg_info "Selecting VM disk storage"
-VM_STORAGE="$(pick_storage_menu "images" "Storage Pools" "Which storage pool would you like to use for ${HN}?")"
-msg_ok "Using ${BL}${VM_STORAGE}${GN} for VM disk storage."
-
-msg_info "Selecting ISO storage"
-ISO_STORAGE="$(pick_storage_menu "iso" "ISO Storage" "Where should the KompassOS ISO be stored?")"
+header
+info "Target ISO storage selection"
+ISO_STORAGE="$(pick_storage_menu "iso" "ISO Storage" "Select where the KompassOS ISO should be stored.")"
 ensure_iso_storage_writable "$ISO_STORAGE"
-msg_ok "Using ${BL}${ISO_STORAGE}${GN} for ISO storage."
+ok "Using ${ISO_STORAGE} for ISO storage."
 
-msg_info "Resolving ISO path"
+info "Target VM disk storage selection"
+VM_STORAGE="$(pick_storage_menu "images" "VM Disk Storage" "Select where the VM disk should be created.")"
+ok "Using ${VM_STORAGE} for VM disk storage."
+
+info "Resolving ISO path"
 ISO_PATH="$(pvesm path "${ISO_STORAGE}:iso/${ISO_NAME}")"
-msg_ok "ISO path: ${BL}${ISO_PATH}${GN}"
+ok "ISO path: ${ISO_PATH}"
 
-if [[ ! -f "$ISO_PATH" ]]; then
-  msg_info "Downloading KompassOS (HWE) ISO"
-  mkdir -p "$(dirname "$ISO_PATH")"
-  curl -f#SL -o "$ISO_PATH" "$ISO_URL"
-  echo -en "\e[1A\e[0K"
-  msg_ok "Downloaded ${BL}${ISO_NAME}${GN}"
-else
-  msg_ok "ISO already exists: ${BL}${ISO_NAME}${GN}"
-fi
-
+download_iso_if_missing "$ISO_PATH"
 if [[ "$VERIFY_SUM" == "yes" ]]; then
-  if command -v sha256sum >/dev/null 2>&1; then
-    msg_info "Downloading checksum (best-effort)"
-    if curl -fsSL -o checksum.txt "$SUM_URL"; then
-      echo -en "\e[1A\e[0K"
-      EXPECTED="$(grep -Eo '([a-fA-F0-9]{64})' checksum.txt | head -n1 || true)"
-      if [[ -n "${EXPECTED:-}" ]]; then
-        msg_info "Verifying SHA256"
-        ACTUAL="$(sha256sum "$ISO_PATH" | awk '{print $1}')"
-        if [[ "${ACTUAL,,}" != "${EXPECTED,,}" ]]; then
-          die "Checksum mismatch for ${ISO_NAME}"
-        fi
-        echo -en "\e[1A\e[0K"
-        msg_ok "Checksum OK"
-      else
-        msg_ok "Checksum format not recognized, skipping verify"
-      fi
-    else
-      echo -en "\e[1A\e[0K"
-      msg_ok "Checksum download failed, skipping verify"
-    fi
-  else
-    msg_ok "sha256sum not found, skipping verify"
-  fi
-else
-  msg_ok "Checksum verification disabled"
+  verify_checksum_best_effort "$ISO_PATH"
 fi
 
-THIN="discard=on,ssd=1,"
-STORAGE_TYPE="$(pvesm status -storage "$VM_STORAGE" | awk 'NR>1 {print $2}')"
-case "$STORAGE_TYPE" in
-  nfs|dir|btrfs) THIN="" ;;
-  *) : ;;
-esac
-
-CPU_ARG=""
-[[ "$CPU_MODEL" == "host" ]] && CPU_ARG="-cpu host"
-
-MACHINE_ARG=""
-[[ "$MACHINE" == "q35" ]] && MACHINE_ARG="-machine q35"
-
-BIOS_ARG=""
-[[ "$UEFI" == "yes" ]] && BIOS_ARG="-bios ovmf"
-
-msg_info "Creating KompassOS (HWE) VM"
-
-qm create "$VMID" \
-  -agent 1 \
-  -tablet 0 \
-  -localtime 1 \
-  ${MACHINE_ARG} \
-  ${BIOS_ARG} \
-  ${CPU_ARG} \
-  -cores "$CORES" \
-  -memory "$RAM_MIB" \
-  -balloon 0 \
-  -name "$HN" \
-  -tags "kompassos" \
-  -net0 "virtio,bridge=${BRIDGE}${VLAN}${MTU}" \
-  -onboot 1 \
-  -ostype l26 \
-  -scsihw virtio-scsi-pci \
-  -rng0 source=/dev/urandom \
-  >/dev/null
-
-if [[ "$UEFI" == "yes" ]]; then
-  qm set "$VMID" -efidisk0 "${VM_STORAGE}:0,format=raw,efitype=4m,pre-enrolled-keys=1" >/dev/null
-fi
-
-qm set "$VMID" -scsi0 "${VM_STORAGE}:${DISK_GIB},format=raw,${DISK_CACHE}${THIN}iothread=1" >/dev/null
-qm set "$VMID" -ide2 "${ISO_STORAGE}:iso/${ISO_NAME},media=cdrom" >/dev/null
-qm set "$VMID" -serial0 socket -vga virtio >/dev/null
-qm set "$VMID" -boot "order=ide2;scsi0" >/dev/null
-
-msg_ok "Created KompassOS (HWE) VM (${BL}${VMID}${GN})"
+create_vm "$VMID" "$HN" "$MACHINE" "$UEFI" "$CPU_MODEL" "$CORES" "$RAM_MIB" "$DISK_GIB" "$DISK_CACHE" "$BRIDGE" "$VLAN" "$MTU" "$VM_STORAGE" "$ISO_STORAGE"
 
 if [[ "$START_VM" == "yes" ]]; then
-  msg_info "Starting VM"
+  info "Starting VM ${VMID}"
   qm start "$VMID" >/dev/null
-  msg_ok "VM started"
+  ok "VM started."
 else
-  msg_ok "VM not started (per selection)"
+  ok "VM not started (per selection)."
 fi
 
-echo -e "\n${TAB}${GN}Done!${CL}"
-echo -e "${TAB}After install (optional): qm set ${VMID} -boot \"order=scsi0;ide2\""
-echo -e "${TAB}KompassOS: https://www.kompassos.nl/"
-echo -e "${TAB}Repo:     https://github.com/L0g0ff/KompassOS\n"
+echo
+ok "Done!"
+echo "${TAB}Install via the Proxmox console (ISO is attached as CD-ROM)."
+echo "${TAB}After install (optional): qm set ${VMID} -boot \"order=scsi0;ide2\""
+echo "${TAB}KompassOS: https://www.kompassos.nl/"
+echo "${TAB}Repo:     https://github.com/L0g0ff/KompassOS"
+echo
