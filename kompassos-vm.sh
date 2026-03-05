@@ -15,17 +15,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# This script creates a KompassOS VM in Proxmox VE and attaches the KompassOS HWE installer ISO.
 # Notes:
-# - Only the HWE ISO is supported.
-# - ISO storage can be dir, nfs, cifs, cephfs, etc. as long as Proxmox can resolve a filesystem path
-#   and it is writable (checked via pvesm path + write test).
-# - Save this file with LF line endings (not CRLF).
+# - Only KompassOS HWE ISO is supported.
+# - ISO storage can be dir/nfs/cifs/cephfs/etc. as long as pvesm path resolves and it is writable.
+# - Disk size is normalized to a numeric GiB value (e.g. "64G" -> "64") to avoid ZFS parsing issues.
+# - Save with LF line endings (not CRLF).
 
 set -euo pipefail
 
 # Community helper functions (telemetry/hooks used by community scripts)
-# If you don't want this dependency, remove the next line and the post_* calls.
 source /dev/stdin <<<"$(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/api.func)"
 
 # --- Script identity (used by api.func) ---
@@ -54,7 +52,6 @@ die()       { msg_error "$1"; echo -e "\nExiting..."; exit 1; }
 
 header_info() {
   clear
-  # "Big" style banner for KompassOS (TAAG Big-like)
   cat <<'EOF'
   _  __                                    ____   _____ 
  | |/ /                                   / __ \ / ____|
@@ -72,7 +69,7 @@ EOF
   echo
 }
 
-# --- KompassOS HWE only (as requested) ---
+# --- KompassOS HWE only ---
 BASE_URL="https://isos.kompassos.nl"
 ISO_NAME="kompassos-dx-hwe.iso"
 ISO_URL="${BASE_URL}/${ISO_NAME}"
@@ -94,7 +91,6 @@ cleanup() {
   popd >/dev/null || true
   rm -rf "$TEMP_DIR" || true
 
-  # Let api.func know final status (best-effort)
   if [[ "${POST_TO_API_DONE:-}" == "true" && "${POST_UPDATE_DONE:-}" != "true" ]]; then
     if [[ $exit_code -eq 0 ]]; then
       post_update_to_api "done" "none" || true
@@ -134,12 +130,8 @@ arch_check() {
 
 pve_check() {
   local ver
-  if command -v pveversion >/dev/null 2>&1; then
-    ver="$(pveversion | awk -F'/' '{print $2}' | awk -F'-' '{print $1}')"
-    [[ "$ver" =~ ^(8|9)\. ]] || die "Unsupported Proxmox VE version: ${ver} (expected 8.x or 9.x)."
-  else
-    die "pveversion not found (are you on a Proxmox VE host?)."
-  fi
+  ver="$(pveversion | awk -F'/' '{print $2}' | awk -F'-' '{print $1}')"
+  [[ "$ver" =~ ^(8|9)\. ]] || die "Unsupported Proxmox VE version: ${ver} (expected 8.x or 9.x)."
 }
 
 ssh_check() {
@@ -172,9 +164,20 @@ exit_script() {
   die "User exited script"
 }
 
+# --- Helpers ---
+# Normalize sizes like "64G", "64g", "64GiB", " 64 " -> "64" (numeric GiB)
+normalize_gib() {
+  local in="${1//[[:space:]]/}"
+  in="${in,,}"                       # lower
+  in="${in%gib}"
+  in="${in%gb}"
+  in="${in%g}"
+  [[ "$in" =~ ^[0-9]+$ ]] || return 1
+  echo "$in"
+}
+
 # --- Storage selection (community-style radiolist) ---
 pick_storage_menu() {
-  # $1: content type (images|iso), $2: title, $3: prompt
   local content="$1"
   local title="$2"
   local prompt="$3"
@@ -215,9 +218,7 @@ pick_storage_menu() {
   echo "$choice"
 }
 
-# ISO storage: accept dir, nfs, cifs, cephfs, etc. as long as:
-# - Proxmox can resolve a filesystem path via pvesm path
-# - The resolved directory is writable
+# ISO storage: accept dir/nfs/cifs/cephfs/... if pvesm path resolves and it is writable
 ensure_iso_storage_writable() {
   local st="$1"
   local test_path test_dir
@@ -240,7 +241,7 @@ UEFI="yes"
 CPU_MODEL="kvm64"
 CORES="4"
 RAM_MIB="8192"
-DISK_SIZE="64G"
+DISK_GIB="64"          # numeric GiB (IMPORTANT)
 DISK_CACHE=""
 BRIDGE="vmbr0"
 VLAN=""
@@ -257,7 +258,7 @@ default_settings() {
   CPU_MODEL="kvm64"
   CORES="4"
   RAM_MIB="8192"
-  DISK_SIZE="64G"
+  DISK_GIB="64"
   DISK_CACHE=""
   BRIDGE="vmbr0"
   VLAN=""
@@ -274,7 +275,7 @@ default_settings() {
   echo -e "${TAB}CPU:       ${CPU_MODEL}"
   echo -e "${TAB}Cores:     ${CORES}"
   echo -e "${TAB}RAM:       ${RAM_MIB} MiB"
-  echo -e "${TAB}Disk:      ${DISK_SIZE}"
+  echo -e "${TAB}Disk:      ${DISK_GIB} GiB"
   echo -e "${TAB}Bridge:    ${BRIDGE}"
   echo -e "${TAB}Checksum:  ${VERIFY_SUM}"
   echo -e "${TAB}Start VM:  ${START_VM}\n"
@@ -333,9 +334,12 @@ advanced_settings() {
     --inputbox "Allocate RAM in MiB" 8 58 "$RAM_MIB" 3>&1 1>&2 2>&3)" || exit_script
   RAM_MIB="${v:-8192}"
 
+  # Disk size: accept "64" or "64G", normalize to numeric GiB
   v="$(whiptail --backtitle "Proxmox VE Helper Scripts" --title "DISK SIZE" \
-    --inputbox "Disk size (e.g. 64G, 100G)" 8 58 "$DISK_SIZE" 3>&1 1>&2 2>&3)" || exit_script
-  DISK_SIZE="$(echo "${v:-64G}" | tr -d ' ')"
+    --inputbox "Disk size in GiB (e.g. 64 or 64G)" 8 58 "${DISK_GIB}G" 3>&1 1>&2 2>&3)" || exit_script
+  if ! DISK_GIB="$(normalize_gib "${v:-64G}")"; then
+    die "Invalid disk size. Use numeric GiB, e.g. 64 or 64G."
+  fi
 
   local cache_choice
   cache_choice="$(whiptail --backtitle "Proxmox VE Helper Scripts" --title "DISK CACHE" \
@@ -384,7 +388,7 @@ advanced_settings() {
   echo -e "${TAB}CPU:       ${CPU_MODEL}"
   echo -e "${TAB}Cores:     ${CORES}"
   echo -e "${TAB}RAM:       ${RAM_MIB} MiB"
-  echo -e "${TAB}Disk:      ${DISK_SIZE}"
+  echo -e "${TAB}Disk:      ${DISK_GIB} GiB"
   echo -e "${TAB}Bridge:    ${BRIDGE}"
   echo -e "${TAB}Checksum:  ${VERIFY_SUM}"
   echo -e "${TAB}Start VM:  ${START_VM}\n"
@@ -415,7 +419,6 @@ pve_check
 ssh_check
 start_menu
 
-# api.func hook (best-effort)
 post_to_api_vm
 
 header_info
@@ -470,7 +473,7 @@ else
   msg_ok "Checksum verification disabled"
 fi
 
-# Thin provisioning/discard on block storage (leave empty for dir/nfs/btrfs)
+# Storage-type tuning
 THIN="discard=on,ssd=1,"
 STORAGE_TYPE="$(pvesm status -storage "$VM_STORAGE" | awk 'NR>1 {print $2}')"
 case "$STORAGE_TYPE" in
@@ -514,11 +517,12 @@ if [[ "$UEFI" == "yes" ]]; then
   qm set "$VMID" -efidisk0 "${VM_STORAGE}:${DISK0}" >/dev/null
 fi
 
-qm set "$VMID" -scsi0 "${VM_STORAGE}:${DISK_SIZE},${DISK_CACHE}${THIN}iothread=1" >/dev/null
+# IMPORTANT: Use numeric GiB size to avoid ZFS "64G" parsing errors.
+qm set "$VMID" -scsi0 "${VM_STORAGE}:${DISK_GIB},format=raw,${DISK_CACHE}${THIN}iothread=1" >/dev/null
 qm set "$VMID" -ide2 "${ISO_STORAGE}:iso/${ISO_NAME},media=cdrom" >/dev/null
 qm set "$VMID" -serial0 socket -vga virtio >/dev/null
 
-# IMPORTANT: Proxmox expects semicolons in boot order
+# Proxmox expects semicolons in boot order
 qm set "$VMID" -boot "order=ide2;scsi0" >/dev/null
 
 DESCRIPTION=$(cat <<'EOF'
