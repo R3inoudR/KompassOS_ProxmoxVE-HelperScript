@@ -17,13 +17,14 @@
 #
 # Notes:
 # - Only KompassOS HWE ISO is supported.
-# - ISO storage can be dir/nfs/cifs/cephfs/etc. as long as pvesm path resolves and it is writable.
-# - Disk size is normalized to a numeric GiB value (e.g. "64G" -> "64") to avoid ZFS parsing issues.
+# - ISO storage can be dir/nfs/cifs/cephfs/... if pvesm path resolves and it is writable.
+# - Disk size is normalized to numeric GiB (e.g. "64G" -> "64") to avoid ZFS parsing issues.
 # - Save with LF line endings (not CRLF).
 
 set -euo pipefail
 
 # Community helper functions (telemetry/hooks used by community scripts)
+# If you don't want this dependency, remove the next line and the post_* calls.
 source /dev/stdin <<<"$(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/api.func)"
 
 # --- Script identity (used by api.func) ---
@@ -52,6 +53,7 @@ die()       { msg_error "$1"; echo -e "\nExiting..."; exit 1; }
 
 header_info() {
   clear
+  # TAAG "Big" banner (as in your screenshot)
   cat <<'EOF'
   _  __                                    ____   _____ 
  | |/ /                                   / __ \ / ____|
@@ -61,8 +63,8 @@ header_info() {
  |_|\_\___/|_| |_| |_| .__/ \__,_|___/___/\____/|_____/ 
                      | |                                
                      |_|                                
-
 EOF
+  echo
   echo "  KompassOS (HWE) VM Installer for Proxmox VE"
   echo "  GitHub: https://github.com/L0g0ff/KompassOS"
   echo "  Site:   https://www.kompassos.nl/"
@@ -164,11 +166,10 @@ exit_script() {
   die "User exited script"
 }
 
-# --- Helpers ---
 # Normalize sizes like "64G", "64g", "64GiB", " 64 " -> "64" (numeric GiB)
 normalize_gib() {
   local in="${1//[[:space:]]/}"
-  in="${in,,}"                       # lower
+  in="${in,,}"
   in="${in%gib}"
   in="${in%gb}"
   in="${in%g}"
@@ -241,7 +242,7 @@ UEFI="yes"
 CPU_MODEL="kvm64"
 CORES="4"
 RAM_MIB="8192"
-DISK_GIB="64"          # numeric GiB (IMPORTANT)
+DISK_GIB="64"          # numeric GiB ONLY
 DISK_CACHE=""
 BRIDGE="vmbr0"
 VLAN=""
@@ -334,7 +335,6 @@ advanced_settings() {
     --inputbox "Allocate RAM in MiB" 8 58 "$RAM_MIB" 3>&1 1>&2 2>&3)" || exit_script
   RAM_MIB="${v:-8192}"
 
-  # Disk size: accept "64" or "64G", normalize to numeric GiB
   v="$(whiptail --backtitle "Proxmox VE Helper Scripts" --title "DISK SIZE" \
     --inputbox "Disk size in GiB (e.g. 64 or 64G)" 8 58 "${DISK_GIB}G" 3>&1 1>&2 2>&3)" || exit_script
   if ! DISK_GIB="$(normalize_gib "${v:-64G}")"; then
@@ -511,10 +511,9 @@ qm create "$VMID" \
   -rng0 source=/dev/urandom \
   >/dev/null
 
+# EFI disk (portable approach: let qm create it)
 if [[ "$UEFI" == "yes" ]]; then
-  DISK0="vm-${VMID}-disk-0"
-  pvesm alloc "$VM_STORAGE" "$VMID" "$DISK0" 4M >/dev/null
-  qm set "$VMID" -efidisk0 "${VM_STORAGE}:${DISK0}" >/dev/null
+  qm set "$VMID" -efidisk0 "${VM_STORAGE}:0,format=raw,efitype=4m,pre-enrolled-keys=1" >/dev/null
 fi
 
 # IMPORTANT: Use numeric GiB size to avoid ZFS "64G" parsing errors.
